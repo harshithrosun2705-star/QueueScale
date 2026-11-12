@@ -1,0 +1,45 @@
+name: Promote verified staging image
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: Image digest verified by running the staging smoke test (sha256:...)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: queuescale-gitops-main
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Promote the exact staging image
+        env:
+          VERIFIED_DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          staging=deploy/overlays/staging/kustomization.yaml
+          production=deploy/overlays/demo-production/kustomization.yaml
+          staging_digest=$(sed -n 's/^    digest: //p' "$staging")
+          [[ "$staging_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$VERIFIED_DIGEST" = "$staging_digest"
+          test "$(grep -Ec '^    (newTag|digest):' "$production")" -eq 1
+          sed -i -E "s/^    (newTag|digest): .*/    digest: $staging_digest/" "$production"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$production"
+          if ! git diff --cached --quiet; then
+            git commit -m "Promote QueueScale to demo production"
+            git push origin HEAD:main
+          fi

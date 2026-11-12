@@ -1,0 +1,117 @@
+name: Test and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'deploy/overlays/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      APP_IMAGE: queuescale:ci
+      DEMO_ACK_DELAY_SECONDS: '30'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build application image
+        run: |
+          docker build --tag "$APP_IMAGE" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" .
+      - name: Run unit tests
+        run: docker run --rm "$APP_IMAGE" python -m unittest discover -s tests -v
+      - name: Test OCR, bounded retries, and worker recovery
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          scripts/check-worker-recovery.sh
+          python3 scripts/smoke.py --negative-tests
+      - name: Print service logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop integration environment
+        if: always()
+        run: docker compose down --volumes
+      - name: Scan the tested image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: queuescale:ci
+          format: table
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Save the tested image for the release job
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: docker save "$APP_IMAGE" | gzip > queuescale-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: queuescale-image
+          path: queuescale-image.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    concurrency:
+      group: queuescale-gitops-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: queuescale-image
+      - name: Verify the candidate still matches the source on main
+        run: |
+          git fetch origin main
+          git diff --exit-code "$GITHUB_SHA" origin/main -- \
+            Dockerfile compose.yaml requirements.txt queuescale tests samples scripts .github/workflows/ci.yaml
+      - name: Publish the tested image and capture its digest
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gzip -dc queuescale-image.tar.gz | docker load
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="$image:$GITHUB_SHA"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag queuescale:ci "$tag"
+          docker push "$tag" | tee "$RUNNER_TEMP/push.log"
+          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/push.log" | tail -n 1)
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published \`$image@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Update the staging overlay
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git switch --detach origin/main
+          file=deploy/overlays/staging/kustomization.yaml
+          test "$(grep -Ec '^    (newTag|digest):' "$file")" -eq 1
+          sed -i -E "s/^    (newTag|digest): .*/    digest: $DIGEST/" "$file"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$file"
+          if ! git diff --cached --quiet; then
+            git commit -m "Deploy QueueScale to staging from $GITHUB_SHA"
+            git push origin HEAD:main
+          fi

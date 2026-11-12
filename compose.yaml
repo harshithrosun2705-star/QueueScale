@@ -1,0 +1,59 @@
+x-app: &app
+  image: ${APP_IMAGE:-queuescale:local}
+  environment:
+    DATABASE_URL: postgresql://queuescale:queuescale@postgres:5432/queuescale
+    AMQP_URL: amqp://queuescale:queuescale@rabbitmq:5672/
+    DEMO_ACK_DELAY_SECONDS: ${DEMO_ACK_DELAY_SECONDS:-0}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: queuescale
+      POSTGRES_PASSWORD: queuescale
+      POSTGRES_DB: queuescale
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "queuescale", "-d", "queuescale"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: queuescale
+      RABBITMQ_DEFAULT_PASS: queuescale
+    volumes:
+      - mq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "queuescale.dispatcher"]
+  worker:
+    <<: *app
+    command: ["python", "-m", "queuescale.worker"]
+    stop_grace_period: 75s
+
+volumes:
+  pg-data:
+  mq-data:

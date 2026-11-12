@@ -6,4 +6,4 @@ resources:
 images:
   - name: queuescale
     newName: ghcr.io/harshithrosun2705-star/queuescale
-    newTag: bootstrap
+    digest: sha256:acb397318e0a8a31ca8a2a5cc82e1fb1ff9e64ca1bdd7eeeb4112123a4226663
